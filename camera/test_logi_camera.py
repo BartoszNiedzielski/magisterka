@@ -4,7 +4,7 @@ import time
 # === CONFIGURATION ===
 # 0 is usually the default laptop webcam or the first USB camera plugged in.
 # If you still have the RealSense plugged in, the Logitech might be 1, 2, or 3.
-CAMERA_INDEX = 0  
+CAMERA_INDEX = 2
 
 def test_camera():
     print(f"[*] Attempting to open camera at index {CAMERA_INDEX}...")
