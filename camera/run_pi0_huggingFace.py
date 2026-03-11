@@ -45,6 +45,9 @@ gripper = None
 # === ACTION NORMALIZATION STATISTICS ===
 ACTION_MEAN = np.array([0.062781565, 0.08684081, -0.09037306, 0.00054074306, 0.00564338, -0.0052290987, -0.049640723], dtype=np.float32)
 ACTION_STD = np.array([0.33552372, 0.378447, 0.4447286, 0.03924354, 0.06339297, 0.077970274, 0.99876714], dtype=np.float32)
+STATE_MEAN = np.array([-0.046518784, 0.03440907, 0.7645525, 2.9722095, -0.22046979, -0.1255794, 0.026914254, -0.027190784], dtype=np.float32)
+STATE_STD = np.array([0.10494395, 0.1517662, 0.3785167, 0.34427345, 0.90694684, 0.3253919, 0.014175904, 0.0140588945], dtype=np.float32)
+
 
 # ==========================================
 # THREAD 1: THE BRAIN (Hugging Face bfloat16 Pi0)
@@ -112,25 +115,34 @@ def vision_loop():
             vis_3rd = frame_3rd.copy()
             vis_wrist = frame_wrist.copy()
 
-            # Resize just in case
-            frame_3rd = cv2.resize(frame_3rd, (256, 256))
-            frame_wrist = cv2.resize(frame_wrist, (256, 256))
+            # --- THE VISUAL BLINDFOLD FIX ---
+            # 1. Convert OpenCV BGR to PyTorch RGB
+            frame_3rd_rgb = cv2.cvtColor(frame_3rd, cv2.COLOR_BGR2RGB)
+            frame_wrist_rgb = cv2.cvtColor(frame_wrist, cv2.COLOR_BGR2RGB)
 
-            dummy_camera = np.zeros((224, 224, 3), dtype=np.uint8)
+            # 2. Resize to exactly 224x224 (as dictated by the pi0 config)
+            frame_3rd_rgb = cv2.resize(frame_3rd_rgb, (224, 224))
+            frame_wrist_rgb = cv2.resize(frame_wrist_rgb, (224, 224))
 
-            frame_3rd = np.transpose(frame_3rd, (2, 0, 1))
-            frame_wrist = np.transpose(frame_wrist, (2, 0, 1))
-            dummy_camera = np.transpose(dummy_camera, (2, 0, 1))
+            # 3. Transpose to (Channels, Height, Width) AND scale pixels to [0.0, 1.0]
+            model_3rd = np.transpose(frame_3rd_rgb, (2, 0, 1)).astype(np.float32) / 255.0
+            model_wrist = np.transpose(frame_wrist_rgb, (2, 0, 1)).astype(np.float32) / 255.0
+            
+            # Dummy camera also needs to be Channels-First and float32
+            dummy_camera = np.zeros((3, 224, 224), dtype=np.float32)
 
             # 4. Get Robot State Safely
             try:
-                # Get 4x4 transform matrix from libfranka
-                print(panda.get_state())
                 current_pose = np.array(panda.get_pose()).reshape(4, 4)
                 pos = current_pose[:3, 3]
                 euler = R.from_matrix(current_pose[:3, :3]).as_euler('xyz')
-                state_6d = np.concatenate([pos, euler]) 
-                state_np = np.append(state_6d, 0.0).astype(np.float32)
+                
+                # Create the 8-dimension state: [X, Y, Z, Roll, Pitch, Yaw, Finger1, Finger2]
+                state_8d = np.concatenate([pos, euler, [0.0, 0.0]]).astype(np.float32)
+                
+                # Normalize the physical state so the AI understands it
+                state_np = (state_8d - STATE_MEAN) / STATE_STD
+
             except Exception as e:
                 print(f"[Brain] Error reading panda state: {e}")
                 continue
@@ -138,8 +150,8 @@ def vision_loop():
             # 5. Build standard LeRobot Inference Frame
             obs_dict = {
                 "observation.state": torch.from_numpy(state_np),
-                "observation.images.image": torch.from_numpy(frame_3rd),
-                "observation.images.image2": torch.from_numpy(frame_wrist),
+                "observation.images.image": torch.from_numpy(model_3rd),
+                "observation.images.image2": torch.from_numpy(model_wrist),
                 "observation.images.empty_camera_0": torch.from_numpy(dummy_camera),
                 "task": INSTRUCTION
             }
@@ -150,15 +162,11 @@ def vision_loop():
                 processed_obs = preprocess(obs_dict)
                 action_chunk = policy.select_action(processed_obs)
                 processed_action = postprocess(action_chunk)
-                print("processed_action shape:", processed_action.shape)
-                print("processed action", processed_action)
-            # with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            #     processed_obs = preprocess(obs_dict)
-            #     action_chunk = policy.select_action(processed_obs)
-            #     processed_action = postprocess(action_chunk)
 
             interference_time = time.time() - start_time
             action_np = processed_action.cpu().numpy()[0]
+            
+            # ... (the rest of your queue logic remains exactly the same) ...
 
             if interference_time > 0.02:
                 chunk_id += 1
@@ -200,91 +208,96 @@ def vision_loop():
 # THREAD 2: THE MUSCLE (Robot Control)
 # ==========================================
 def control_loop():
-    global is_running, latest_chunk, chunk_timestamp, panda, gripper
+    global is_running, panda, gripper
     
     print("[Muscle] Robot Online. Ready to move.")
 
-    active_chunk = None
-    local_chunk_time = 0.0
-    step_idx = 0
     current_chunk_id = -1
+    
+    # We will store the offset between the virtual world and the real world here
+    frame_offset_pos = np.zeros(3)
+    frame_offset_rot = R.identity()
+
+    gripper_is_closed = False
 
     while is_running:
-
         try:
             chunk_id, step_in_chunk, current_action = action_queue.get(timeout=0.1)
         except queue.Empty:
             continue
-        # with state_lock:
-        #     if latest_chunk is not None and chunk_timestamp > local_chunk_time:
-        #         active_chunk = np.copy(latest_chunk)
-                
-        #         # --- THE FIX: FORCE 2D SHAPE ---
-        #         if active_chunk.ndim == 1:
-        #             active_chunk = np.expand_dims(active_chunk, axis=0)
-                    
-        #         local_chunk_time = chunk_timestamp
-        #         step_idx = 0
-        #         # print("new chunk received")
 
-        # if active_chunk is not None and step_idx < len(active_chunk):
-        #     current_action = active_chunk[step_idx]
-
-        # Detect if this is the start of a new trajectory
-        if chunk_id != current_chunk_id:
-            print(f"\n[Muscle] >>> STARTING NEW TRAJECTORY CHUNK: #{chunk_id} <<<")
-            current_chunk_id = chunk_id
-
-        print("current_action before denorm:", current_action)
-        print("current_action shape:", current_action.shape)
-
+        # 1. Un-normalize the model's output to get Virtual Absolute Coordinates
         current_action = (current_action * ACTION_STD) + ACTION_MEAN
-        
-        target_dx, target_dy, target_dz, target_droll, target_dpitch, target_dyaw, target_grip = current_action[:7]
+        target_x, target_y, target_z, target_roll, target_pitch, target_yaw, target_grip = current_action[:7]
 
-        print(f"[Muscle] Chunk {chunk_id} Step {step_in_chunk} | dX={target_dx:.3f}, dY={target_dy:.3f}, dZ={target_dz:.3f} | Grip={target_grip:.2f}")
-        # print(f"[Muscle] Step {step_idx}: dX={target_dx:.3f}, dY={target_dy:.3f}, dZ={target_dz:.3f} | Grip={target_grip:.2f}")
+        # Convert virtual target to numpy array and scipy Rotation object
+        virtual_pos = np.array([target_x, target_y, target_z])
+        virtual_rot = R.from_euler('xyz', [target_roll, target_pitch, target_yaw], degrees=False)
 
-        # --- SAFETY CLAMPS ---
-        target_dx = np.clip(target_dx, -0.05, 0.05)
-        target_dy = np.clip(target_dy, -0.05, 0.05)
-        target_dz = np.clip(target_dz, -0.05, 0.05)
-        
-        MAX_ROT = 0.1 
-        target_droll = np.clip(target_droll, -MAX_ROT, MAX_ROT)
-        target_dpitch = np.clip(target_dpitch, -MAX_ROT, MAX_ROT)
-        target_dyaw = np.clip(target_dyaw, -MAX_ROT, MAX_ROT)
+        # 2. ANCHOR THE TRAJECTORY (Calculate the Offset on Step 0)
+        if chunk_id != current_chunk_id:
+            print(f"\n[Muscle] >>> ANCHORING NEW TRAJECTORY CHUNK: #{chunk_id} <<<")
+            current_chunk_id = chunk_id
+            
+            # Find out where the robot is physically sitting RIGHT NOW
+            current_pose = np.array(panda.get_pose()).reshape(4, 4)
+            physical_pos = current_pose[:3, 3]
+            physical_rot = R.from_matrix(current_pose[:3, :3])
+            
+            # Calculate the mathematical difference between Real Life and the Virtual World
+            frame_offset_pos = physical_pos - virtual_pos
+            frame_offset_rot = physical_rot * virtual_rot.inv()
 
+        # 3. Apply the Offset to map the virtual absolute point into our real room
+        target_pos = virtual_pos + frame_offset_pos
+        target_rot = frame_offset_rot * virtual_rot
+
+        # 4. NEW SAFETY CLAMPS (Limit Step Speed, Not Absolute Position)
         current_pose = np.array(panda.get_pose()).reshape(4, 4)
         current_pos = current_pose[:3, 3]
-        current_rot_mat = current_pose[:3, :3]
-        current_rot = R.from_matrix(current_rot_mat)
+        
+        # Calculate how far this specific step wants us to move from our current physical spot
+        step_delta_pos = target_pos - current_pos
+        print(f"[Muscle] Raw Target Pos: {target_pos}, Current Pos: {current_pos}, Step Delta: {step_delta_pos}")
+        
+        # Clamp the physical delta to a maximum of 5cm per 20ms to prevent violent jerks
+        step_delta_pos = np.clip(step_delta_pos, -0.05, 0.05) 
+        safe_target_pos = current_pos + step_delta_pos
 
-        delta_rot = R.from_euler('xyz', [target_droll, target_dpitch, target_dyaw], degrees=False)
-        target_rot = delta_rot * current_rot
-        target_pos = current_pos + np.array([target_dx, target_dy, target_dz])
+        if (safe_target_pos[0] > 0.7 or safe_target_pos[0] < 0 
+            or safe_target_pos[1] > 0.3 or safe_target_pos[1] < -0.3 
+            or safe_target_pos[2] > 0.65 or safe_target_pos[2] < 0.05): 
+            print("Warning: Attempted to move beyond safe box limits.")
+            continue
 
-        # Un-comment this block to actually move the physical robot!
-        '''
-        target_pose = np.eye(4)
-        target_pose[:3, :3] = target_rot.as_matrix()
-        target_pose[:3, 3]  = target_pos
+        print(f"[Muscle] Chunk {chunk_id} Step {step_in_chunk} | Target X: {safe_target_pos[0]:.3f}, Y: {safe_target_pos[1]:.3f}, Z: {safe_target_pos[2]:.3f} | Grip: {target_grip:.2f}")
+
+        # 5. EXECUTE PHYSICAL MOVEMENT
+        target_pose_mat = np.eye(4)
+        target_pose_mat[:3, :3] = target_rot.as_matrix()
+        target_pose_mat[:3, 3]  = safe_target_pos
+        
         try:
-            panda.move_to_pose(target_pose, speed_factor=0.05)
+            panda.move_to_pose(target_pose_mat, speed_factor=0.05)
             
-            if target_grip < 0.5:
+            should_close = target_grip < 0.0 
+            
+            # Only send the command if the model wants to change the current state
+            if should_close and not gripper_is_closed:
+                print("[Muscle] -> Executing GRASP")
                 gripper.grasp(width=0.0, speed=0.1, force=40)
-            else:
+                gripper_is_closed = True
+                
+            elif not should_close and gripper_is_closed:
+                print("[Muscle] -> Executing RELEASE")
                 gripper.move(width=0.08, speed=0.1)
+                gripper_is_closed = False
         except Exception as e:
             print(f"[Muscle] Motion Error: {e}")
-        '''
-        step_idx += 1
+        
+        # Wait 20ms before grabbing the next action from the queue
         time.sleep(0.02) 
 
-        # else:
-        #     time.sleep(0.01)
-    
     print("[Muscle] Shutting down.")
 
 
@@ -304,9 +317,10 @@ if __name__ == "__main__":
         print("[*] Homing robot...")
         panda.move_to_start(speed_factor=0.05)
         pose = panda.get_pose()
-        pose[2,3] -= 0.2
+        pose[2,3] -= 0.35
         q = panda_py.ik(pose)
         panda.move_to_joint_position(q, speed_factor=0.05)
+        gripper.move(width=0.08, speed=0.1)
         time.sleep(1)
     except Exception as e:
         print(f"[*] Fatal Error connecting to Robot: {e}")
