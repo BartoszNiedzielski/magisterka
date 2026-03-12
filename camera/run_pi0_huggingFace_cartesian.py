@@ -1,4 +1,4 @@
-# GPU Inference Activated! (Removed the CPU override)
+# GPU Inference Activated!
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "" 
 
@@ -9,6 +9,7 @@ import torch
 import threading
 import logging
 import queue
+from scipy.spatial.transform import Rotation as R
 
 import panda_py
 from panda_py import libfranka
@@ -31,7 +32,6 @@ CAM_INDEX_WRIST = 0
 action_queue = queue.Queue(maxsize=20)
 is_running = True
 
-# Global robot instances
 desk = None
 panda = None
 gripper = None
@@ -58,12 +58,12 @@ def vision_loop():
         is_running = False
         return
     
-    # Let PyTorch use the GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Brain] Loading Pi0 on {device}...")
     model_id = "lerobot/pi0_libero_base"
 
     try:
+        # strict=False saves the model from amnesia!
         policy = PI0Policy.from_pretrained(
             model_id,
             device=device,
@@ -93,7 +93,6 @@ def vision_loop():
             ret_wrist, frame_wrist = cap_wrist.read()
             
             if not ret_3rd or not ret_wrist:
-                print("[Brain] Missed camera frame, skipping...")
                 continue
 
             vis_3rd = frame_3rd.copy()
@@ -110,21 +109,21 @@ def vision_loop():
             model_wrist = np.transpose(frame_wrist_rgb, (2, 0, 1)).astype(np.float32) / 255.0
             dummy_camera = np.zeros((3, 224, 224), dtype=np.float32)
 
-            # --- STATE PREPARATION (JOINT SPACE) ---
+            # --- STATE PREPARATION (CARTESIAN) ---
             try:
-                # Get the 7 joint angles
-                current_state = panda.get_state()
-                q_angles = np.array(current_state.q, dtype=np.float32)
+                current_pose = np.array(panda.get_pose()).reshape(4, 4)
+                pos = current_pose[:3, 3]
+                euler = R.from_matrix(current_pose[:3, :3]).as_euler('xyz')
                 
-                # Get gripper width (rough heuristic to map it to 0.0 or 1.0)
-                grip_width = gripper.read_once().max_width
-                grip_state = 1.0 if grip_width < 0.01 else 0.0
+                if gripper.read_once().is_grasped:
+                    grip_state = 1.0
+                else:
+                    grip_state = 0.0
                 
-                # Combine into 8D and manually normalize
-                state_8d = np.append(q_angles, grip_state).astype(np.float32)
+                # 8-Dimension State: [X, Y, Z, Roll, Pitch, Yaw, Finger1, Finger2]
+                state_8d = np.concatenate([pos, euler, [grip_state, grip_state]]).astype(np.float32)
                 state_8d_norm = (state_8d - STATE_MEAN) / STATE_STD
 
-                # Pad to 32 dimensions for the Pi0 dual-arm architecture
                 state_32d = np.zeros(32, dtype=np.float32)
                 state_32d[:8] = state_8d_norm
 
@@ -132,7 +131,6 @@ def vision_loop():
                 print(f"[Brain] Error reading panda state: {e}")
                 continue
 
-            # Build LeRobot Dictionary
             obs_dict = {
                 "observation.state": torch.from_numpy(state_32d).unsqueeze(0).to(device) if "cuda" not in str(device) else torch.from_numpy(state_32d),
                 "observation.images.image": torch.from_numpy(model_3rd),
@@ -143,14 +141,9 @@ def vision_loop():
 
             start_time = time.time()
             with torch.inference_mode():
-                print("obs_dict['observation.state']:", obs_dict['observation.state'])
                 processed_obs = preprocess(obs_dict)
-                print("processed_obs['observation.state']:", processed_obs['observation.state'])
                 action_chunk = policy.select_action(processed_obs)
-                print("raw_action_chunk", action_chunk.cpu().numpy()[0])
                 processed_action = postprocess(action_chunk)
-
-            print("postproccessed_action", processed_action.cpu().numpy()[0])
 
             interference_time = time.time() - start_time
             action_np = processed_action.cpu().numpy()[0]
@@ -168,9 +161,8 @@ def vision_loop():
 
             action_queue.put(tracked_action)
 
-            # Debug Video Feed
             debug_view = np.hstack((cv2.resize(vis_3rd, (320, 240)), cv2.resize(vis_wrist, (320, 240))))
-            cv2.putText(debug_view, f"Latency: {time.time() - start_time:.3f}s", (10, 30), cv2.FONT_ITALIC, 0.7, (0, 255, 0), 2)
+            cv2.putText(debug_view, f"Latency: {time.time() - start_time:.3f}s", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.imshow("Pi0 Vision", debug_view)
             
             if cv2.waitKey(1) == ord('q'):
@@ -193,48 +185,74 @@ def control_loop():
     print("[Muscle] Robot Online. Ready to move.")
     gripper_is_closed = False
 
+    current_chunk_id = -1
+    frame_offset_pos = np.zeros(3)
+    frame_offset_rot = R.identity()
+
     while is_running:
         try:
             chunk_id, step_in_chunk, current_action = action_queue.get(timeout=0.1)
         except queue.Empty:
             continue
 
-        # print("current_action.shape:", current_action.shape)
+        # 1. Un-normalize output back into Absolute Cartesian Coordinates
+        current_action = (current_action * ACTION_STD) + ACTION_MEAN
+        target_x, target_y, target_z, target_roll, target_pitch, target_yaw, target_grip = current_action[:7]
 
-        # 1. Extract Target Joint Angles (Un-normalizing the first 7 dims)
-        target_q_norm = current_action[:7]
-        target_q = (target_q_norm * ACTION_STD) + ACTION_MEAN
-        
-        # 8th dimension is the gripper command
-        target_grip = current_action[7] 
+        virtual_pos = np.array([target_x, target_y, target_z])
+        virtual_rot = R.from_euler('xyz', [target_roll, target_pitch, target_yaw], degrees=False)
 
-        # 2. Get the physical robot's current joint angles
+        # 2. ANCHOR THE TRAJECTORY (Apply the Simulator-to-Real-World Offset)
+        if chunk_id != current_chunk_id:
+            print(f"\n[Muscle] >>> ANCHORING NEW TRAJECTORY CHUNK: #{chunk_id} <<<")
+            current_chunk_id = chunk_id
+            
+            try:
+                current_pose = np.array(panda.get_pose()).reshape(4, 4)
+                physical_pos = current_pose[:3, 3]
+                physical_rot = R.from_matrix(current_pose[:3, :3])
+                
+                frame_offset_pos = physical_pos - virtual_pos
+                frame_offset_rot = physical_rot * virtual_rot.inv()
+            except Exception as e:
+                print(f"[Muscle] Offset Error: {e}")
+                continue
+
+        # Map virtual absolute curve into real-world physical space
+        target_pos = virtual_pos + frame_offset_pos
+        target_rot = frame_offset_rot * virtual_rot
+
+        # 3. SAFETY CLAMPS
         try:
-            current_state = panda.get_state()
-            current_q = np.array(current_state.q)
-        except Exception as e:
-            print(f"[Muscle] Error getting state: {e}")
+            current_pose = np.array(panda.get_pose()).reshape(4, 4)
+            current_pos = current_pose[:3, 3]
+        except Exception:
+            continue
+            
+        step_delta_pos = target_pos - current_pos
+        step_delta_pos = np.clip(step_delta_pos, -0.05, 0.05) 
+        safe_target_pos = current_pos + step_delta_pos
+
+        # Kill switch for unsafe workspace boundaries
+        if (safe_target_pos[0] > 0.7 or safe_target_pos[0] < 0 
+            or safe_target_pos[1] > 0.3 or safe_target_pos[1] < -0.3 
+            or safe_target_pos[2] > 0.65 or safe_target_pos[2] < 0.05): 
+            print("[Warning] Movement rejected: Attempted to move outside safe box limits.")
             continue
 
-        # 3. JOINT SAFETY CLAMPS
-        # Limit the delta to 0.05 radians (~2.8 degrees) per 20ms step
-        MAX_JOINT_DELTA = 0.05 
-        step_delta_q = target_q - current_q
-        step_delta_q = np.clip(step_delta_q, -MAX_JOINT_DELTA, MAX_JOINT_DELTA)
-        
-        safe_target_q = current_q + step_delta_q
-
-        # Print debug for Joint 1 and Joint 7 to ensure numbers are stable
-        if step_in_chunk % 5 == 0:
-            print(f"[Muscle] Chunk {chunk_id} Step {step_in_chunk} | Target J1: {safe_target_q[0]:.3f}, J7: {safe_target_q[6]:.3f} | Grip: {target_grip:.2f}")
+        # if step_in_chunk % 5 == 0:
+        print(f"[Muscle] Chunk {chunk_id} Step {step_in_chunk} | Target X: {safe_target_pos[0]:.3f}, Y: {safe_target_pos[1]:.3f}, Z: {safe_target_pos[2]:.3f} | Grip: {target_grip:.2f}")
 
         # 4. EXECUTE PHYSICAL MOVEMENT
+        target_pose_mat = np.eye(4)
+        target_pose_mat[:3, :3] = target_rot.as_matrix()
+        target_pose_mat[:3, 3]  = safe_target_pos
+        
         try:
-            # Move directly in Joint Space!
-            # panda.move_to_joint_position(safe_target_q, speed_factor=0.05)
+            # panda.move_to_pose(target_pose_mat, speed_factor=0.05)
             
             # Gripper Logic (0.0 is open, 1.0 is closed)
-            should_close = target_grip > 0.0 
+            should_close = target_grip > 0.5 
             
             if should_close and not gripper_is_closed:
                 print("[Muscle] -> Executing GRASP")
@@ -249,7 +267,6 @@ def control_loop():
         except Exception as e:
             print(f"[Muscle] Motion Error: {e}")
         
-        # Wait 20ms to hit the 50Hz control loop standard
         time.sleep(0.02) 
 
     print("[Muscle] Shutting down.")
@@ -270,9 +287,8 @@ if __name__ == "__main__":
         
         print("[*] Homing robot...")
         panda.move_to_start(speed_factor=0.05)
-        # Give it a slightly lower starting posture
         pose = panda.get_pose()
-        pose[2,3] -= 0.2
+        pose[2,3] -= 0.35
         q = panda_py.ik(pose)
         panda.move_to_joint_position(q, speed_factor=0.05)
         gripper.move(width=0.08, speed=0.1)
