@@ -17,6 +17,7 @@ from panda_py import libfranka
 
 panda = panda_py.Panda(hostname)
 gripper = libfranka.Gripper(hostname)
+gripper.homing()
 
 # print(panda.get_state())
 # print(panda.get_model())
