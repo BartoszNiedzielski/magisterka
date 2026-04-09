@@ -75,6 +75,7 @@ if __name__ == '__main__':
 
     panda = panda_py.Panda(hostname)
     gripper = libfranka.Gripper(hostname)
+    gripper.homing()
     
     # Setup LeRobot Dataset schema to include cameras and 8D states/actions
     dataset_dir = Path("outputs/panda_pick_task")
@@ -93,19 +94,19 @@ if __name__ == '__main__':
                 "observation.images.exterior": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
                 "observation.images.wrist": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
                 "observation.state": {"dtype": "float32", "shape": (8,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "grip"]},
-                "action": {"dtype": "float32", "shape": (8,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "grip"]},
+                "actions": {"dtype": "float32", "shape": (8,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "grip"]},
             },
             fps=FPS,
             image_writer_threads=4,
         )
 
     print("[*] Homing robot and opening gripper...")
-    panda.move_to_start(speed_factor=0.05)
+    panda.move_to_start(speed_factor=0.1)
     gripper.move(width=0.08, speed=0.1)
     pose = panda.get_pose()
     pose[2,3] -= 0.1 #see if it is good
     q = panda_py.ik(pose)
-    panda.move_to_joint_position(q, speed_factor=0.05)
+    panda.move_to_joint_position(q, speed_factor=0.1)
     gripper.move(width=0.08, speed=0.1)
     time.sleep(1)
     current_grip_state = 0.0
@@ -115,18 +116,24 @@ if __name__ == '__main__':
     positions = []
     panda.teaching_mode(True) 
 
-    for i in range(3):
+    for i in range(2):
         input(f'Manually move the arm to Pose {i+1} and press Enter...')
         positions.append(panda.q)
 
     panda.teaching_mode(False) 
 
-    # --- 3. Prep for Replay ---
+    # --- Prep for Replay ---
     input('\nPress Enter to move to Start Position (Pose 1)...')
-    panda.move_to_joint_position(positions[0], speed_factor=0.1)
+    panda.move_to_start(speed_factor=0.1)
+    gripper.move(width=0.08, speed=0.1)
+    pose = panda.get_pose()
+    pose[2,3] -= 0.1 #see if it is good
+    q = panda_py.ik(pose)
+    panda.move_to_joint_position(q, speed_factor=0.1)
+    gripper.move(width=0.08, speed=0.1)
+    time.sleep(1)
 
     input('\nReady to record. Press Enter to Replay and Save to Dataset...')
-
     # --- 4. Replay & Record Phase ---
     print("🔴 RECORDING STARTED...")
     trajectory_buffer = []
@@ -137,15 +144,15 @@ if __name__ == '__main__':
     rec_thread.start()
 
     try:
-        print("Moving to Position 2...")
-        panda.move_to_joint_position(positions[1], speed_factor=0.1)
+        print("Moving to Position 1...")
+        panda.move_to_joint_position(positions[0], speed_factor=0.1)
 
         print("Grasping...")
         gripper.grasp(width=0.0, speed=0.1, force=40.0)
         current_grip_state = 1.0 # Update state so the recording thread sees it
 
-        print("Moving to Position 3...")
-        panda.move_to_joint_position(positions[2], speed_factor=0.1)
+        print("Moving to Position 2...")
+        panda.move_to_joint_position(positions[1], speed_factor=0.1)
 
     finally:
         # D. Stop Recording Safely
@@ -160,22 +167,26 @@ if __name__ == '__main__':
     # --- 5. Format and Save to LeRobot ---
     print(f"\nProcessing {len(trajectory_buffer)} frames for LeRobot...")
     
+    # Define the string once to ensure no typos
+    instruction = "pick up the green cube"
+
     for i in range(len(trajectory_buffer) - 1):
-        # Unpack the current and next frames from our buffer
         current_state_q, current_grip, ext_img, wrist_img = trajectory_buffer[i]
         next_state_q, next_grip, _, _ = trajectory_buffer[i + 1]
         
-        # Combine the 7 joint angles + 1 gripper state into 8D vectors
-        state_vector = np.concatenate([current_state_q, [current_grip]])
-        action_vector = np.concatenate([next_state_q, [next_grip]])
+        state_vector = np.concatenate([current_state_q, [current_grip]]).astype(np.float32)
+        action_vector = np.concatenate([next_state_q, [next_grip]]).astype(np.float32)
 
-        # Push the frame directly to the LeRobot dataset
-        dataset.add_frame({
+        # Create the frame dictionary
+        frame = {
             "observation.images.exterior": ext_img,
             "observation.images.wrist": wrist_img,
             "observation.state": state_vector,
-            "action": action_vector
-        })
+            "actions": action_vector,
+            "task": instruction
+        }
+        
+        dataset.add_frame(frame)
 
-    dataset.save_episode(task="pick up the green cube")
-    print("✅ Dataset episode saved successfully! You can run this script multiple times to add more episodes.")
+    dataset.save_episode()
+    print("✅ Dataset episode saved successfully!")
