@@ -21,7 +21,7 @@ gripper.homing()
 
 # print(panda.get_state())
 # print(panda.get_model())
-gripper.grasp(0, 0.2, 10, 0.04, 0.04)
+gripper.grasp(0, 0.2, 5, 0.04, 0.04)
 # grip_width = gripper.read_once()
 print(gripper.read_once().is_grasped)
 # grip_state = 1.0 if grip_width < 0.01 else 0.0

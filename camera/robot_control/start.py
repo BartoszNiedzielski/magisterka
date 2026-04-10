@@ -19,8 +19,10 @@ panda = panda_py.Panda(hostname)
 gripper = libfranka.Gripper(hostname)
 
 panda.move_to_start(speed_factor=0.05)
-pose = panda.get_pose()
-pose[2,3] -= 0.1
-q = panda_py.ik(pose)
-panda.move_to_joint_position(q, speed_factor=0.05)
+# pose = panda.get_pose()
+# pose[2,3] -= 0.1
+# q = panda_py.ik(pose)
+# panda.move_to_joint_position(q, speed_factor=0.05)
+print(panda.get_state())
+print(panda.q)
 # print(panda.get_position())

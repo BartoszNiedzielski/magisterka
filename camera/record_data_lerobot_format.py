@@ -6,7 +6,7 @@ import cv2
 from pathlib import Path
 import panda_py
 from panda_py import libfranka
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # --- Configuration ---
 hostname = '172.16.0.2'
@@ -101,13 +101,12 @@ if __name__ == '__main__':
         )
 
     print("[*] Homing robot and opening gripper...")
-    panda.move_to_start(speed_factor=0.1)
+    panda.move_to_start(speed_factor=0.2)
     gripper.move(width=0.08, speed=0.1)
     pose = panda.get_pose()
     pose[2,3] -= 0.1 #see if it is good
     q = panda_py.ik(pose)
-    panda.move_to_joint_position(q, speed_factor=0.1)
-    gripper.move(width=0.08, speed=0.1)
+    panda.move_to_joint_position(q, speed_factor=0.2)
     time.sleep(1)
     current_grip_state = 0.0
 
@@ -124,18 +123,17 @@ if __name__ == '__main__':
 
     # --- Prep for Replay ---
     input('\nPress Enter to move to Start Position (Pose 1)...')
-    panda.move_to_start(speed_factor=0.1)
+    panda.move_to_start(speed_factor=0.2)
     gripper.move(width=0.08, speed=0.1)
     pose = panda.get_pose()
     pose[2,3] -= 0.1 #see if it is good
     q = panda_py.ik(pose)
-    panda.move_to_joint_position(q, speed_factor=0.1)
-    gripper.move(width=0.08, speed=0.1)
+    panda.move_to_joint_position(q, speed_factor=0.2)
     time.sleep(1)
 
     input('\nReady to record. Press Enter to Replay and Save to Dataset...')
     # --- 4. Replay & Record Phase ---
-    print("🔴 RECORDING STARTED...")
+    print("RECORDING STARTED...")
     trajectory_buffer = []
     is_recording = True
     
@@ -162,31 +160,34 @@ if __name__ == '__main__':
         # Release cameras
         cap_ext.release()
         cap_wrist.release()
-        print("⏹️ RECORDING STOPPED.")
+        print("RECORDING STOPPED.")
 
     # --- 5. Format and Save to LeRobot ---
     print(f"\nProcessing {len(trajectory_buffer)} frames for LeRobot...")
-    
-    # Define the string once to ensure no typos
     instruction = "pick up the green cube"
+
+    dt = 1.0 / FPS
 
     for i in range(len(trajectory_buffer) - 1):
         current_state_q, current_grip, ext_img, wrist_img = trajectory_buffer[i]
         next_state_q, next_grip, _, _ = trajectory_buffer[i + 1]
         
         state_vector = np.concatenate([current_state_q, [current_grip]]).astype(np.float32)
-        action_vector = np.concatenate([next_state_q, [next_grip]]).astype(np.float32)
+        joint_velocities = (next_state_q - current_state_q) / dt
+        action_vector = np.concatenate([joint_velocities, [next_grip]]).astype(np.float32)
 
-        # Create the frame dictionary
         frame = {
             "observation.images.exterior": ext_img,
             "observation.images.wrist": wrist_img,
             "observation.state": state_vector,
             "actions": action_vector,
-            "task": instruction
         }
         
-        dataset.add_frame(frame)
+        dataset.add_frame(frame, task=instruction)
 
     dataset.save_episode()
-    print("✅ Dataset episode saved successfully!")
+    print("Dataset episode saved successfully!")
+
+    # data visualization sanity check (optional)
+    # command to visualize:
+    # python -m lerobot.scripts.visualize_dataset   --repo-id local/panda_pick_task   --root /home/student/bartosz_niedzielski/panda/magisterka/camera/outputs/panda_pick_task   --mode local   --episode-index 13
