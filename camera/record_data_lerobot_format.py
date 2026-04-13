@@ -25,6 +25,8 @@ is_recording = False
 trajectory_buffer = []
 current_grip_state = 0.0 # 0.0 = Open, 1.0 = Closed
 
+episode_successful = True # Flag to track if the episode was successful or if we encountered an error
+
 def recording_thread(panda, cap_ext, cap_wrist):
     """Background loop that captures state AND cameras exactly at 15Hz"""
     global is_recording, trajectory_buffer, current_grip_state
@@ -122,16 +124,16 @@ if __name__ == '__main__':
     panda.teaching_mode(False) 
 
     # --- Prep for Replay ---
-    input('\nPress Enter to move to Start Position (Pose 1)...')
+    input('\nPress Enter to move to Start Position (Pose 1)... and replay the trajectory while recording data.')
     panda.move_to_start(speed_factor=0.2)
     gripper.move(width=0.08, speed=0.1)
     pose = panda.get_pose()
     pose[2,3] -= 0.1 #see if it is good
     q = panda_py.ik(pose)
     panda.move_to_joint_position(q, speed_factor=0.2)
-    time.sleep(1)
+    time.sleep(2)
 
-    input('\nReady to record. Press Enter to Replay and Save to Dataset...')
+    # input('\nReady to record. Press Enter to Replay and Save to Dataset...')
     # --- 4. Replay & Record Phase ---
     print("RECORDING STARTED...")
     trajectory_buffer = []
@@ -152,6 +154,18 @@ if __name__ == '__main__':
         print("Moving to Position 2...")
         panda.move_to_joint_position(positions[1], speed_factor=0.1)
 
+    except Exception as e:
+        # <--- NEW: Catch the packet loss / reflex error here!
+        print(f"\n[!] ERROR DETECTED DURING REPLAY: {e}")
+        print("[!] Skipping dataset save for this corrupted episode.")
+        episode_successful = False
+        
+        # Optional: Attempt to clear the robot's error state so you can try again immediately
+        try:
+            panda.recover()
+        except:
+            pass
+
     finally:
         # D. Stop Recording Safely
         is_recording = False
@@ -162,31 +176,33 @@ if __name__ == '__main__':
         cap_wrist.release()
         print("RECORDING STOPPED.")
 
-    # --- 5. Format and Save to LeRobot ---
-    print(f"\nProcessing {len(trajectory_buffer)} frames for LeRobot...")
-    instruction = "pick up the green cube"
+    if episode_successful:
 
-    dt = 1.0 / FPS
+        # --- 5. Format and Save to LeRobot ---
+        print(f"\nProcessing {len(trajectory_buffer)} frames for LeRobot...")
+        instruction = "pick up the green cube"
 
-    for i in range(len(trajectory_buffer) - 1):
-        current_state_q, current_grip, ext_img, wrist_img = trajectory_buffer[i]
-        next_state_q, next_grip, _, _ = trajectory_buffer[i + 1]
-        
-        state_vector = np.concatenate([current_state_q, [current_grip]]).astype(np.float32)
-        joint_velocities = (next_state_q - current_state_q) / dt
-        action_vector = np.concatenate([joint_velocities, [next_grip]]).astype(np.float32)
+        dt = 1.0 / FPS
 
-        frame = {
-            "observation.images.exterior": ext_img,
-            "observation.images.wrist": wrist_img,
-            "observation.state": state_vector,
-            "actions": action_vector,
-        }
-        
-        dataset.add_frame(frame, task=instruction)
+        for i in range(len(trajectory_buffer) - 1):
+            current_state_q, current_grip, ext_img, wrist_img = trajectory_buffer[i]
+            next_state_q, next_grip, _, _ = trajectory_buffer[i + 1]
+            
+            state_vector = np.concatenate([current_state_q, [current_grip]]).astype(np.float32)
+            joint_velocities = (next_state_q - current_state_q) / dt
+            action_vector = np.concatenate([joint_velocities, [next_grip]]).astype(np.float32)
 
-    dataset.save_episode()
-    print("Dataset episode saved successfully!")
+            frame = {
+                "observation.images.exterior": ext_img,
+                "observation.images.wrist": wrist_img,
+                "observation.state": state_vector,
+                "actions": action_vector,
+            }
+            
+            dataset.add_frame(frame, task=instruction)
+
+        dataset.save_episode()
+        print("Dataset episode saved successfully!")
 
     # data visualization sanity check (optional)
     # command to visualize:
