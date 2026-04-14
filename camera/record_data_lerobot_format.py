@@ -15,8 +15,8 @@ password = 'Frankenstein'
 FPS = 15
 
 # Camera Indices (Adjust these based on your OS assignment)
-EXTERIOR_CAMERA_INDEX = 0
-WRIST_CAMERA_INDEX = 2
+EXTERIOR_CAMERA_INDEX = 2
+WRIST_CAMERA_INDEX = 0
 
 logging.basicConfig(level=logging.INFO)
 
@@ -77,6 +77,7 @@ if __name__ == '__main__':
 
     panda = panda_py.Panda(hostname)
     gripper = libfranka.Gripper(hostname)
+    gripper.move(width=0.08, speed=0.1)
     gripper.homing()
     
     # Setup LeRobot Dataset schema to include cameras and 8D states/actions
