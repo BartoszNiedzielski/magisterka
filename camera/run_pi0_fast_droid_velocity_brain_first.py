@@ -19,7 +19,8 @@ ROBOT_USER = 'Dentec'
 ROBOT_PASS = 'Frankenstein'
 
 INSTRUCTION = "pick up the green cube"
-ACTION_SCALE = 0.1  # Scale factor to convert model's output to real-world velocities
+CHECKPOINT_DIR = "/home/student/ft/checkpoints/panda_pi05_499/"
+ACTION_SCALE = 0.1  # Conservative first-test scale on a real robot.
 CONTROL_HZ = 15  # How fast the muscle thread executes actions (15Hz = 0.067s per step)
 
 # --- CAMERA CONFIGURATION ---
@@ -38,33 +39,14 @@ latest_grip = 0.0
 gripper = None
 panda = None
 desk = None
-vel_ctrl = None # NEW: Global velocity controller
+vel_ctrl = None
 
 # ==========================================
 # THREAD 1: THE BRAIN (Vision & AI)
 # ==========================================
-def vision_loop():
+def vision_loop(cap_ext, cap_wrist, policy):
     global latest_action_chunk, is_running, gripper, panda
     
-    print(f"[Brain] Starting Logitech Cameras (Exterior: {EXTERIOR_CAMERA_INDEX}, Wrist: {WRIST_CAMERA_INDEX})...")
-    
-    cap_ext = cv2.VideoCapture(EXTERIOR_CAMERA_INDEX)
-    cap_wrist = cv2.VideoCapture(WRIST_CAMERA_INDEX)
-
-    if not cap_ext.isOpened():
-        print(f"[Brain] ERROR: Could not open Exterior Camera {EXTERIOR_CAMERA_INDEX}.")
-        is_running = False
-        return
-    if not cap_wrist.isOpened():
-        print(f"[Brain] ERROR: Could not open Wrist Camera {WRIST_CAMERA_INDEX}.")
-        is_running = False
-        return
-
-    print("[Brain] Downloading/Loading Pi0 Droid model...")
-    pi0_config = _config.get_config("pi05_droid")
-    checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
-    policy = policy_config.create_trained_policy(pi0_config, checkpoint_dir)
-
     print("[Brain] AI Online. Listening for visual updates...")
     
     try:
@@ -99,7 +81,7 @@ def vision_loop():
             if hasattr(action_chunk, 'cpu'): action_chunk = action_chunk.cpu().numpy()
             elif hasattr(action_chunk, 'device'): action_chunk = np.array(action_chunk)
             
-            print(f"[Brain] Generated chunk of {len(action_chunk)} actions. (Latency: {time.time() - start_time:.3f}s)")
+            # print(f"[Brain] Generated chunk of {len(action_chunk)} actions. (Latency: {time.time() - start_time:.3f}s)")
 
             h_ext, w_ext, _ = image_ext_rgb.shape
             h_wrist, w_wrist, _ = image_wrist_rgb.shape
@@ -113,7 +95,7 @@ def vision_loop():
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     pass
             except cv2.error:
-                cv2.imwrite("camera_debug_view.jpg", display_frame)
+                pass # Fail silently if display isn't available
 
             with state_lock:
                 latest_action_chunk = action_chunk.copy()
@@ -138,16 +120,16 @@ def control_loop():
         step_start = time.time()
 
         with state_lock:
-            if latest_action_chunk is not None:
+            if latest_action_chunk is not None and (current_chunk is None or step_index >= 15):
                 current_chunk = latest_action_chunk
                 latest_action_chunk = None  
-                step_index = 0              
+                step_index = 0
+                print(f"[Muscle] Received new action chunk with {len(current_chunk)} steps.")             
 
         if current_chunk is not None and step_index < len(current_chunk):
             action = current_chunk[step_index]
             step_index += 1
 
-            # Extract velocities and explicitly format as float64 for panda_py
             target_velocities = (action[:7] * ACTION_SCALE).astype(np.float64)
             grip = action[7]
 
@@ -158,40 +140,41 @@ def control_loop():
                 predicted_pose = np.array(panda_py.fk(target_joints))
                 safe_target_pos = predicted_pose[:3, 3] 
                 
-                # Bounding box check
                 if (safe_target_pos[0] > 0.7 or safe_target_pos[0] < 0 
                     or safe_target_pos[1] > 0.3 or safe_target_pos[1] < -0.3 
-                    or safe_target_pos[2] > 0.65 or safe_target_pos[2] < 0.05): 
+                    or safe_target_pos[2] > 0.65 or safe_target_pos[2] < 0.06): 
                     print(f"[Warning] Movement rejected. Predicted POS: {safe_target_pos}")
-                    vel_ctrl.set_control(np.zeros(7, dtype=np.float64)) # STOP ROBOT
+                    vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
                     continue  
                 
             except Exception as e:
                 print(f"[Muscle] FK calculation failed: {e}")
-                vel_ctrl.set_control(np.zeros(7, dtype=np.float64)) # STOP ROBOT
+                vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
                 continue
 
-            # --- APPLY VELOCITY CONTROL ---
             # vel_ctrl.set_control(target_velocities)
-            vel_ctrl.set_control(np.zeros(7, dtype=np.float64)) # STOP ROBOT
-            # print(f"[Muscle] Step {step_index}/{len(current_chunk)} | Target Vel: {target_velocities} | Grip: {grip:.2f}")
+            vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
             
             try:
+                print("current grip:" + str(grip))
+
+                if grip >= 0.5:
+                    print("should be closing")
                 with state_lock:
                     current_grip_state = latest_grip
 
-                # ONLY command gripper if the state has explicitly changed
                 if grip >= 0.5 and current_grip_state == 0.0:
+                    print("[Muscle] Closing gripper...")
                     gripper.grasp(width=0.0, speed=0.1, force=40)
                     with state_lock: latest_grip = 1.0
                 elif grip < 0.5 and current_grip_state == 1.0:
+                    print("[Muscle] Opening gripper...")
                     gripper.move(width=0.08, speed=0.1)
                     with state_lock: latest_grip = 0.0
             except Exception:
                 pass
 
         else:
-            # If we run out of actions from the brain, halt safely
             vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
 
         elapsed = time.time() - step_start
@@ -206,7 +189,52 @@ def control_loop():
 # ==========================================
 if __name__ == "__main__":
     print("[*] Booting Asynchronous Robotics System...")
-    print("[*] Initializing Robot Connection First...")
+    
+    # --- 1. INITIALIZE AI & CAMERAS FIRST ---
+    print(f"[*] Starting Logitech Cameras (Exterior: {EXTERIOR_CAMERA_INDEX}, Wrist: {WRIST_CAMERA_INDEX})...")
+    cap_ext = cv2.VideoCapture(EXTERIOR_CAMERA_INDEX)
+    cap_wrist = cv2.VideoCapture(WRIST_CAMERA_INDEX)
+
+    if not cap_ext.isOpened() or not cap_wrist.isOpened():
+        print("[!] ERROR: Could not open cameras. Check indices.")
+        exit(1)
+
+    print("[*] Loading local fine-tuned Pi0 Droid model...")
+    pi0_config = _config.get_config("pi05_droid")
+    checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
+    policy = policy_config.create_trained_policy(pi0_config, checkpoint_dir)
+
+    # --- 2. THE WARM-UP PASS (Fixes the 21s lag) ---
+    print("\n[*] Warming up the AI (This will take ~20 seconds)...")
+    ret_ext, frame_ext = cap_ext.read()
+    ret_wrist, frame_wrist = cap_wrist.read()
+    
+    if ret_ext and ret_wrist:
+        image_ext_rgb = cv2.cvtColor(frame_ext, cv2.COLOR_BGR2RGB)
+        image_wrist_rgb = cv2.cvtColor(frame_wrist, cv2.COLOR_BGR2RGB)
+        
+        # Create fake robot data for the warmup since the robot isn't connected yet.
+        # (JIT Compilation only cares about the tensor shapes, not the actual values!)
+        dummy_joints = np.zeros(7, dtype=np.float32)
+        dummy_grip = np.zeros(1, dtype=np.float32)
+
+        warmup_example = {
+            "observation/exterior_image_1_left": image_ext_rgb,
+            "observation/wrist_image_left": image_wrist_rgb,
+            "observation/gripper_position": dummy_grip,
+            "observation/joint_position": dummy_joints,
+            "prompt": INSTRUCTION
+        }
+        
+        start_time = time.time()
+        _ = policy.infer(warmup_example)
+        print(f"[+] AI Warmup Complete! (Took {time.time() - start_time:.2f}s)\n")
+    else:
+        print("[!] ERROR: Could not read cameras for warmup.")
+        exit(1)
+
+    # --- 3. CONNECT TO ROBOT ---
+    print("[*] Initializing Robot Connection...")
     try:
         desk = panda_py.Desk(ROBOT_IP, ROBOT_USER, ROBOT_PASS)
         desk.unlock()
@@ -218,13 +246,12 @@ if __name__ == "__main__":
         print("[*] Homing robot...")
         panda.move_to_start(speed_factor=0.05)
         pose = panda.get_pose()
-        pose[2,3] -= 0.3 #change to 0.3 after testing
+        pose[2,3] -= 0.1
         q = panda_py.ik(pose)
         panda.move_to_joint_position(q, speed_factor=0.05)
         gripper.move(width=0.08, speed=0.1)
         time.sleep(1)
 
-        # --- START VELOCITY CONTROLLER ---
         print("[*] Engaging Velocity Steering...")
         vel_ctrl = controllers.IntegratedVelocity()
         panda.start_controller(vel_ctrl)
@@ -233,7 +260,8 @@ if __name__ == "__main__":
         print(f"[*] Fatal Error connecting to Robot: {e}")
         exit(1)
     
-    brain_thread = threading.Thread(target=vision_loop)
+    # --- 4. START THREADS ---
+    brain_thread = threading.Thread(target=vision_loop, args=(cap_ext, cap_wrist, policy))
     muscle_thread = threading.Thread(target=control_loop)
     
     brain_thread.start()
@@ -252,7 +280,7 @@ if __name__ == "__main__":
     
     try:
         print("[*] Stopping controllers and locking brakes...")
-        panda.stop_controller() # Stop the streaming controller gracefully
+        panda.stop_controller() 
         desk.lock()
         desk.release_control()
     except Exception:
