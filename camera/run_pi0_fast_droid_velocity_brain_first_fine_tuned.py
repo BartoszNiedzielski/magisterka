@@ -46,7 +46,6 @@ vel_ctrl = None
 # ==========================================
 def vision_loop(cap_ext, cap_wrist, policy):
     global latest_action_chunk, is_running, gripper, panda
-    
     print("[Brain] AI Online. Listening for visual updates...")
     
     try:
@@ -120,11 +119,12 @@ def control_loop():
         step_start = time.time()
 
         with state_lock:
-            if latest_action_chunk is not None and (current_chunk is None or step_index >= 15):
+            if latest_action_chunk is not None:
+            # if latest_action_chunk is not None and (current_chunk is None or step_index >= 15):
                 current_chunk = latest_action_chunk
                 latest_action_chunk = None  
                 step_index = 0
-                print(f"[Muscle] Received new action chunk with {len(current_chunk)} steps.")             
+                print(f"[Muscle] Received new action chunk with {len(current_chunk)} steps.")       
 
         if current_chunk is not None and step_index < len(current_chunk):
             action = current_chunk[step_index]
@@ -152,11 +152,12 @@ def control_loop():
                 vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
                 continue
 
-            # vel_ctrl.set_control(target_velocities)
-            vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
+            vel_ctrl.set_control(target_velocities)
+            # vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
+            print(f"[Muscle] Step {step_index}/{len(current_chunk)} | Target Vel: {target_velocities} | Grip: {grip:.2f}")
             
             try:
-                print("current grip:" + str(grip))
+                # print("current grip:" + str(grip))
 
                 if grip >= 0.5:
                     print("should be closing")
