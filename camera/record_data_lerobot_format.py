@@ -6,7 +6,7 @@ import cv2
 from pathlib import Path
 import panda_py
 from panda_py import libfranka
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 # --- Configuration ---
 hostname = '172.16.0.2'
@@ -81,17 +81,17 @@ if __name__ == '__main__':
     gripper.homing()
     
     # Setup LeRobot Dataset schema to include cameras and 8D states/actions
-    dataset_dir = Path("outputs/panda_pick_task")
+    dataset_dir = Path("outputs/panda_pick_and_place")
     
     if dataset_dir.exists():
         print("[*] Found existing dataset. Loading it to append a new episode...")
         # Initialize normally to append to the existing dataset
-        dataset = LeRobotDataset("local/panda_pick_task", root=dataset_dir)
+        dataset = LeRobotDataset("local/panda_pick_and_place", root=dataset_dir)
     else:
         print("[*] Creating new dataset folder...")
         # Create fresh dataset schema
         dataset = LeRobotDataset.create(
-            repo_id="local/panda_pick_task",
+            repo_id="local/panda_pick_and_place",
             root=dataset_dir,
             features={
                 "observation.images.exterior": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
@@ -116,11 +116,14 @@ if __name__ == '__main__':
     # --- 2. Teaching Phase ---
     print('\n--- Teaching Mode: Poses ---')
     positions = []
-    panda.teaching_mode(True) 
+    panda.teaching_mode(True)
 
-    for i in range(2):
+    for i in range(1):
         input(f'Manually move the arm to Pose {i+1} and press Enter...')
         positions.append(panda.q)
+        pose = panda.get_pose()
+        print(pose)
+        print(panda.get_position())
 
     panda.teaching_mode(False) 
 
@@ -152,8 +155,45 @@ if __name__ == '__main__':
         gripper.grasp(width=0.0, speed=0.1, force=40.0)
         current_grip_state = 1.0 # Update state so the recording thread sees it
 
-        print("Moving to Position 2...")
-        panda.move_to_joint_position(positions[1], speed_factor=0.1)
+        pose = panda.get_pose()
+        pose[2,3] += 0.1
+        panda.move_to_pose(pose,speed_factor=0.1)
+        # q = panda_py.ik(pose)
+        # panda.move_to_joint_position(q, speed_factor=0.1)
+
+
+        print("move to prep drop area")
+        drop_pose = np.array([
+        [ 0.996302, -0.07637459, 0.03911541, 0.61723842],
+        [-0.0788481, -0.99467823, 0.06617418, 0.16486688],
+        [ 0.03385322, -0.06901365, -0.9970411, 0.12573585],
+        [ 0.0,          0.0,          0.0,          1.0        ]
+        ], dtype=np.float64)
+        q = panda_py.ik(drop_pose)
+        panda.move_to_joint_position(q, speed_factor=0.2)
+
+        print("moving to place area")
+        place_pose = np.array([
+            [ 0.99673478, -0.07589372,  0.02721537,  0.60739891],
+            [-0.07610894, -0.99706556,  0.00695978,  0.16566014],
+            [ 0.02660730, -0.00900838, -0.99960536,  0.03852027],
+            [ 0.0,         0.0,         0.0,         1.0       ]
+        ], dtype=np.float64)
+        q = panda_py.ik(place_pose)
+        panda.move_to_joint_position(q, speed_factor=0.1)
+
+
+        gripper.move(width=0.08, speed=0.1)
+        current_grip_state = 0.0
+
+        pose = panda.get_pose()
+        pose[2,3] += 0.1
+        panda.move_to_pose(pose,speed_factor=0.1)
+        # q = panda_py.ik(pose)
+        # panda.move_to_joint_position(q, speed_factor=0.1)
+
+        # print("Moving to Position 2...")
+        # panda.move_to_joint_position(positions[1], speed_factor=0.1)
 
     except Exception as e:
         # <--- NEW: Catch the packet loss / reflex error here!
@@ -181,7 +221,7 @@ if __name__ == '__main__':
 
         # --- 5. Format and Save to LeRobot ---
         print(f"\nProcessing {len(trajectory_buffer)} frames for LeRobot...")
-        instruction = "pick up the green cube"
+        instruction = "place the green cube in the yellow area"
 
         dt = 1.0 / FPS
 
@@ -198,13 +238,14 @@ if __name__ == '__main__':
                 "observation.images.wrist": wrist_img,
                 "observation.state": state_vector,
                 "actions": action_vector,
+                "task": instruction
             }
             
-            dataset.add_frame(frame, task=instruction)
+            dataset.add_frame(frame)
 
         dataset.save_episode()
         print("Dataset episode saved successfully!")
 
     # data visualization sanity check (optional)
     # command to visualize:
-    # python -m lerobot.scripts.visualize_dataset   --repo-id local/panda_pick_task   --root /home/student/bartosz_niedzielski/panda/magisterka/camera/outputs/panda_pick_task   --mode local   --episode-index 13
+    # python -m lerobot.scripts.visualize_dataset   --repo-id local/panda_pick_and_place   --root /home/student/bartosz_niedzielski/panda/magisterka/camera/outputs/panda_pick_and_place   --mode local   --episode-index 13
