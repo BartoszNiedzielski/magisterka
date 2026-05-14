@@ -60,8 +60,8 @@ def vision_loop(cap_ext, cap_wrist, policy):
             image_wrist_rgb = cv2.cvtColor(frame_wrist, cv2.COLOR_BGR2RGB)
 
             with state_lock:
-                is_closed = gripper.read_once().is_grasped
-                current_grip_state = 1.0 if is_closed else 0.0
+                width = gripper.read_once().width
+                current_grip_state = 1.0 if width<0.04 else 0.0
                 current_joints = np.array(panda.q, dtype=np.float32)
 
             example = {
@@ -151,8 +151,8 @@ def control_loop():
                 vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
                 continue
 
-            # vel_ctrl.set_control(target_velocities)
-            vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
+            vel_ctrl.set_control(target_velocities)
+            # vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
             
             try:
                 print("current grip:" + str(grip))
