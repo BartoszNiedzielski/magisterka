@@ -14,7 +14,7 @@ username = 'Dentec'
 password = 'Frankenstein'
 FPS = 15
 
-# Camera Indices (Adjust these based on your OS assignment)
+# Camera Indices
 EXTERIOR_CAMERA_INDEX = 2
 WRIST_CAMERA_INDEX = 0
 
@@ -25,7 +25,7 @@ is_recording = False
 trajectory_buffer = []
 current_grip_state = 0.0 # 0.0 = Open, 1.0 = Closed
 
-episode_successful = True # Flag to track if the episode was successful or if we encountered an error
+episode_successful = True
 
 def recording_thread(panda, cap_ext, cap_wrist):
     """Background loop that captures state AND cameras exactly at 15Hz"""
@@ -62,7 +62,6 @@ if __name__ == '__main__':
     cap_ext = cv2.VideoCapture(EXTERIOR_CAMERA_INDEX)
     cap_wrist = cv2.VideoCapture(WRIST_CAMERA_INDEX)
     
-    # Force camera resolution to standard 480x640 to match Droid config
     for cap in (cap_ext, cap_wrist):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -80,23 +79,22 @@ if __name__ == '__main__':
     gripper.move(width=0.08, speed=0.1)
     gripper.homing()
     
-    # Setup LeRobot Dataset schema to include cameras and 8D states/actions
+    # --- DROID-LeRobot v2.1 Schema ---
     dataset_dir = Path("outputs/panda_pick_and_place")
     
     if dataset_dir.exists():
         print("[*] Found existing dataset. Loading it to append a new episode...")
-        # Initialize normally to append to the existing dataset
         dataset = LeRobotDataset("local/panda_pick_and_place", root=dataset_dir)
     else:
         print("[*] Creating new dataset folder...")
-        # Create fresh dataset schema
         dataset = LeRobotDataset.create(
             repo_id="local/panda_pick_and_place",
             root=dataset_dir,
             features={
-                "observation.images.exterior": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
-                "observation.images.wrist": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
-                "observation.state": {"dtype": "float32", "shape": (8,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "grip"]},
+                "observation/exterior_image_1_left": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
+                "observation/wrist_image_left": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
+                "observation/joint_position": {"dtype": "float32", "shape": (7,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7"]},
+                "observation/gripper_position": {"dtype": "float32", "shape": (1,), "names": ["grip"]},
                 "actions": {"dtype": "float32", "shape": (8,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "grip"]},
             },
             fps=FPS,
@@ -107,7 +105,7 @@ if __name__ == '__main__':
     panda.move_to_start(speed_factor=0.2)
     gripper.move(width=0.08, speed=0.1)
     pose = panda.get_pose()
-    pose[2,3] -= 0.1 #see if it is good
+    pose[2,3] -= 0.1 
     q = panda_py.ik(pose)
     panda.move_to_joint_position(q, speed_factor=0.2)
     time.sleep(1)
@@ -132,18 +130,16 @@ if __name__ == '__main__':
     panda.move_to_start(speed_factor=0.2)
     gripper.move(width=0.08, speed=0.1)
     pose = panda.get_pose()
-    pose[2,3] -= 0.1 #see if it is good
+    pose[2,3] -= 0.1 
     q = panda_py.ik(pose)
     panda.move_to_joint_position(q, speed_factor=0.2)
     time.sleep(2)
 
-    # input('\nReady to record. Press Enter to Replay and Save to Dataset...')
     # --- 4. Replay & Record Phase ---
     print("RECORDING STARTED...")
     trajectory_buffer = []
     is_recording = True
     
-    # Start the background watcher, passing the camera objects
     rec_thread = threading.Thread(target=recording_thread, args=(panda, cap_ext, cap_wrist))
     rec_thread.start()
 
@@ -153,14 +149,11 @@ if __name__ == '__main__':
 
         print("Grasping...")
         gripper.grasp(width=0.0, speed=0.1, force=40.0)
-        current_grip_state = 1.0 # Update state so the recording thread sees it
+        current_grip_state = 1.0 
 
         pose = panda.get_pose()
         pose[2,3] += 0.1
         panda.move_to_pose(pose,speed_factor=0.1)
-        # q = panda_py.ik(pose)
-        # panda.move_to_joint_position(q, speed_factor=0.1)
-
 
         print("move to prep drop area")
         drop_pose = np.array([
@@ -182,26 +175,18 @@ if __name__ == '__main__':
         q = panda_py.ik(place_pose)
         panda.move_to_joint_position(q, speed_factor=0.1)
 
-
         gripper.move(width=0.08, speed=0.1)
         current_grip_state = 0.0
 
         pose = panda.get_pose()
         pose[2,3] += 0.1
         panda.move_to_pose(pose,speed_factor=0.1)
-        # q = panda_py.ik(pose)
-        # panda.move_to_joint_position(q, speed_factor=0.1)
-
-        # print("Moving to Position 2...")
-        # panda.move_to_joint_position(positions[1], speed_factor=0.1)
 
     except Exception as e:
-        # <--- NEW: Catch the packet loss / reflex error here!
         print(f"\n[!] ERROR DETECTED DURING REPLAY: {e}")
         print("[!] Skipping dataset save for this corrupted episode.")
         episode_successful = False
         
-        # Optional: Attempt to clear the robot's error state so you can try again immediately
         try:
             panda.recover()
         except:
@@ -212,7 +197,6 @@ if __name__ == '__main__':
         is_recording = False
         rec_thread.join()
         
-        # Release cameras
         cap_ext.release()
         cap_wrist.release()
         print("RECORDING STOPPED.")
@@ -223,20 +207,18 @@ if __name__ == '__main__':
         print(f"\nProcessing {len(trajectory_buffer)} frames for LeRobot...")
         instruction = "place the green cube in the yellow area"
 
-        dt = 1.0 / FPS
-
         for i in range(len(trajectory_buffer) - 1):
             current_state_q, current_grip, ext_img, wrist_img = trajectory_buffer[i]
             next_state_q, next_grip, _, _ = trajectory_buffer[i + 1]
             
-            state_vector = np.concatenate([current_state_q, [current_grip]]).astype(np.float32)
-            joint_velocities = (next_state_q - current_state_q) / dt
-            action_vector = np.concatenate([joint_velocities, [next_grip]]).astype(np.float32)
+            # Action vector is now absolute joint positions, not velocities
+            action_vector = np.concatenate([next_state_q, [next_grip]]).astype(np.float32)
 
             frame = {
-                "observation.images.exterior": ext_img,
-                "observation.images.wrist": wrist_img,
-                "observation.state": state_vector,
+                "observation/exterior_image_1_left": ext_img,
+                "observation/wrist_image_left": wrist_img,
+                "observation/joint_position": current_state_q,
+                "observation/gripper_position": np.array([current_grip], dtype=np.float32),
                 "actions": action_vector,
                 "task": instruction
             }
@@ -246,6 +228,6 @@ if __name__ == '__main__':
         dataset.save_episode()
         print("Dataset episode saved successfully!")
 
-    # data visualization sanity check (optional)
+ # data visualization sanity check (optional)
     # command to visualize:
     # python -m lerobot.scripts.visualize_dataset   --repo-id local/panda_pick_and_place   --root /home/student/bartosz_niedzielski/panda/magisterka/camera/outputs/panda_pick_and_place   --mode local   --episode-index 13
