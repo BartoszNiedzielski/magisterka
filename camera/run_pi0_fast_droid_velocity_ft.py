@@ -19,6 +19,7 @@ ROBOT_PASS = 'Frankenstein'
 
 INSTRUCTION = "pick up the green cube"
 CHECKPOINT_DIR = "/home/student/ft/checkpoints/panda_pi05_499/"
+# CHECKPOINT_DIR = "/home/student/ft/checkpoints/pi05-panda-vel-40-v1/checkpoint_250"
 ACTION_SCALE = 0.1  # Conservative first-test scale on a real robot.
 CONTROL_HZ = 15  # How fast the muscle thread executes actions (15Hz = 0.067s per step)
 
@@ -119,7 +120,7 @@ def control_loop():
         step_start = time.time()
 
         with state_lock:
-            if latest_action_chunk is not None and (current_chunk is None or step_index >= 15):
+            if latest_action_chunk is not None:
                 current_chunk = latest_action_chunk
                 latest_action_chunk = None  
                 step_index = 0
@@ -141,7 +142,7 @@ def control_loop():
                 
                 if (safe_target_pos[0] > 0.7 or safe_target_pos[0] < 0 
                     or safe_target_pos[1] > 0.3 or safe_target_pos[1] < -0.3 
-                    or safe_target_pos[2] > 0.65 or safe_target_pos[2] < 0.06): 
+                    or safe_target_pos[2] > 0.65 or safe_target_pos[2] < 0.04): 
                     print(f"[Warning] Movement rejected. Predicted POS: {safe_target_pos}")
                     vel_ctrl.set_control(np.zeros(7, dtype=np.float64))
                     continue  
@@ -199,7 +200,7 @@ if __name__ == "__main__":
         exit(1)
 
     print("[*] Loading local fine-tuned Pi0 Droid model...")
-    pi0_config = _config.get_config("pi05_droid")
+    pi0_config = _config.get_config("pi05_droid_finetune")
     policy = policy_config.create_trained_policy(pi0_config, CHECKPOINT_DIR)
 
     # --- 2. THE WARM-UP PASS (Fixes the 21s lag) ---

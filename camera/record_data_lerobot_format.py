@@ -80,22 +80,23 @@ if __name__ == '__main__':
     gripper.homing()
     
     # --- DROID-LeRobot v2.1 Schema ---
-    dataset_dir = Path("outputs/panda_pick_and_place")
+    dataset_dir = Path("outputs/hard_pick_and_place")
     
     if dataset_dir.exists():
         print("[*] Found existing dataset. Loading it to append a new episode...")
-        dataset = LeRobotDataset("local/panda_pick_and_place", root=dataset_dir)
+        dataset = LeRobotDataset("local/hard_pick_and_place", root=dataset_dir)
     else:
         print("[*] Creating new dataset folder...")
         dataset = LeRobotDataset.create(
-            repo_id="local/panda_pick_and_place",
+            repo_id="local/hard_pick_and_place",
             root=dataset_dir,
             features={
-                "observation/exterior_image_1_left": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
-                "observation/wrist_image_left": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
-                "observation/joint_position": {"dtype": "float32", "shape": (7,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7"]},
-                "observation/gripper_position": {"dtype": "float32", "shape": (1,), "names": ["grip"]},
+                "exterior_image_1_left": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
+                "wrist_image_left": {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
+                "joint_position": {"dtype": "float32", "shape": (7,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7"]},
+                "gripper_position": {"dtype": "float32", "shape": (1,), "names": ["grip"]},
                 "actions": {"dtype": "float32", "shape": (8,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "grip"]},
+                "state": {"dtype": "float32", "shape": (8,), "names": ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "grip"]},
             },
             fps=FPS,
             image_writer_threads=4,
@@ -116,7 +117,7 @@ if __name__ == '__main__':
     positions = []
     panda.teaching_mode(True)
 
-    for i in range(1):
+    for i in range(2):
         input(f'Manually move the arm to Pose {i+1} and press Enter...')
         positions.append(panda.q)
         pose = panda.get_pose()
@@ -147,6 +148,9 @@ if __name__ == '__main__':
         print("Moving to Position 1...")
         panda.move_to_joint_position(positions[0], speed_factor=0.1)
 
+        print("Moving to Position 2...")
+        panda.move_to_joint_position(positions[1], speed_factor=0.1)
+
         print("Grasping...")
         gripper.grasp(width=0.0, speed=0.1, force=40.0)
         current_grip_state = 1.0 
@@ -162,8 +166,8 @@ if __name__ == '__main__':
         [ 0.03385322, -0.06901365, -0.9970411, 0.12573585],
         [ 0.0,          0.0,          0.0,          1.0        ]
         ], dtype=np.float64)
-        q = panda_py.ik(drop_pose)
-        panda.move_to_joint_position(q, speed_factor=0.2)
+        # q = panda_py.ik(drop_pose)
+        # panda.move_to_joint_position(q, speed_factor=0.2)
 
         print("moving to place area")
         place_pose = np.array([
@@ -172,8 +176,10 @@ if __name__ == '__main__':
             [ 0.02660730, -0.00900838, -0.99960536,  0.03852027],
             [ 0.0,         0.0,         0.0,         1.0       ]
         ], dtype=np.float64)
-        q = panda_py.ik(place_pose)
-        panda.move_to_joint_position(q, speed_factor=0.1)
+        # q = panda_py.ik(place_pose)
+        # panda.move_to_joint_position(q, speed_factor=0.1)
+
+        panda.move_to_pose([drop_pose, place_pose], speed_factor=0.05)
 
         gripper.move(width=0.08, speed=0.1)
         current_grip_state = 0.0
@@ -203,6 +209,8 @@ if __name__ == '__main__':
 
     if episode_successful:
 
+        dt = 1.0 / FPS
+
         # --- 5. Format and Save to LeRobot ---
         print(f"\nProcessing {len(trajectory_buffer)} frames for LeRobot...")
         instruction = "place the green cube in the yellow area"
@@ -212,15 +220,20 @@ if __name__ == '__main__':
             next_state_q, next_grip, _, _ = trajectory_buffer[i + 1]
             
             # Action vector is now absolute joint positions, not velocities
-            action_vector = np.concatenate([next_state_q, [next_grip]]).astype(np.float32)
+            # action_vector = np.concatenate([next_state_q, [next_grip]]).astype(np.float32)
+            state_vector = np.concatenate([current_state_q, [current_grip]]).astype(np.float32)
+
+            joint_velocities = (next_state_q - current_state_q) / dt
+            action_vector = np.concatenate([joint_velocities, [next_grip]]).astype(np.float32)
 
             frame = {
-                "observation/exterior_image_1_left": ext_img,
-                "observation/wrist_image_left": wrist_img,
-                "observation/joint_position": current_state_q,
-                "observation/gripper_position": np.array([current_grip], dtype=np.float32),
+                "exterior_image_1_left": ext_img,
+                "wrist_image_left": wrist_img,
+                "joint_position": current_state_q,
+                "gripper_position": np.array([current_grip], dtype=np.float32),
                 "actions": action_vector,
-                "task": instruction
+                "task": instruction,
+                "state": state_vector,
             }
             
             dataset.add_frame(frame)

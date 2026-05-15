@@ -120,6 +120,7 @@ def control_loop():
         if current_chunk is not None and step_index < len(current_chunk):
             action = current_chunk[step_index]
             step_index += 1
+            print(f"action: {action}")
 
             # Extract absolute joint positions directly from the action array
             target_joints = action[:7].astype(np.float64)
@@ -136,7 +137,9 @@ def control_loop():
                     
                     print(f"[Warning] Movement rejected. Predicted POS: {safe_target_pos}")
                     # Skip this step to avoid collision
-                    continue  
+                    continue
+                # else:
+                #     print(f"Predicted POS: {safe_target_pos}")
                 
             except Exception as e:
                 print(f"[Muscle] FK calculation failed: {e}")
@@ -145,7 +148,7 @@ def control_loop():
             # Execute the safe joint position target using native method
             try:
                 # Using a very fast speed factor to allow the 15Hz loop to dictate the pace
-                panda.move_to_joint_position(target_joints, speed_factor=0.2)
+                panda.move_to_joint_position(target_joints, speed_factor=0.05)
                 print(f"[Muscle] Step {step_index}/{len(current_chunk)} | Target Pos Executed | Grip: {grip:.2f}")
             except Exception as e:
                 print(f"[Muscle] Execution skipped/failed: {e}")

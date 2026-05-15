@@ -4,7 +4,7 @@ import json
 import pandas as pd
 
 # --- Configuration ---
-dataset_path = "/home/student/bartosz_niedzielski/panda/magisterka/camera/outputs/panda_pick_task"
+dataset_path = "/home/student/bartosz_niedzielski/panda/magisterka/camera/outputs/panda_pick_and_place"
 meta_dir = os.path.join(dataset_path, "meta")
 
 print("[*] Scanning dataset to find the last episode...")
